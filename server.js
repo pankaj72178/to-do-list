@@ -198,7 +198,13 @@ app.use((err, req, res, next) => {
     return res.status(404).json({ error: "Task not found" });
   }
   console.error(err);
-  res.status(500).json({ error: "Internal server error" });
+  // TEMPORARY DEBUG: expose the real error so we can diagnose the Vercel
+  // deployment. Remove `detail`/`name` once the connection works.
+  res.status(500).json({
+    error: "Internal server error",
+    name: err.name,
+    detail: err.message,
+  });
 });
 
 // ---------------------------------------------------------------------
