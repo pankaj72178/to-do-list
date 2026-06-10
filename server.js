@@ -1,50 +1,57 @@
 // =====================================================================
-// To-do / Task REST API — Node.js + Express + MongoDB (Mongoose)
-// ---------------------------------------------------------------------
-// Tasks are now persisted in MongoDB instead of an in-memory array, so
-// data survives server restarts. Single-file app with clear sections.
+// To-do / Task REST API — Express + MongoDB (Mongoose)
+// Works BOTH locally (app.listen) and on Vercel (serverless export).
 // =====================================================================
 
-require("dotenv").config(); // load MONGODB_URI (and PORT) from .env
+require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI;
 
-// Parse JSON request bodies (populates req.body for POST/PUT).
 app.use(express.json());
 
 // ---------------------------------------------------------------------
-// Database connection
+// Database connection (serverless-friendly, cached across invocations)
 // ---------------------------------------------------------------------
-if (!MONGODB_URI) {
-  console.error("❌ Missing MONGODB_URI. Add it to your .env file.");
-  process.exit(1);
+// On Vercel, each request may run in a fresh container. We cache the
+// connection promise on a module-level variable so warm invocations reuse
+// the existing connection instead of opening a new one every time.
+let cachedConn = null;
+async function connectDB() {
+  if (!MONGODB_URI) {
+    throw new Error("Missing MONGODB_URI environment variable");
+  }
+  if (cachedConn) return cachedConn;
+  // bufferCommands:false makes queries fail fast if not connected (better in serverless)
+  cachedConn = mongoose.connect(MONGODB_URI, { bufferCommands: false });
+  await cachedConn;
+  return cachedConn;
 }
 
-mongoose
-  .connect(MONGODB_URI)
-  .then(() => console.log("✅ Connected to MongoDB"))
-  .catch((err) => {
-    console.error("❌ MongoDB connection error:", err.message);
-    process.exit(1);
-  });
+// Make sure the DB is connected before any route runs. If it can't connect,
+// the error flows to the error handler as a clean 500 — it never crashes
+// the whole function (which is what caused FUNCTION_INVOCATION_FAILED).
+app.use(async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
 
 // ---------------------------------------------------------------------
 // Schema & Model
 // ---------------------------------------------------------------------
-// Mongoose schema enforces the data shape at the database layer.
 const taskSchema = new mongoose.Schema(
   {
     title: { type: String, required: true, trim: true },
     completed: { type: Boolean, default: false },
   },
   {
-    timestamps: true, // adds createdAt / updatedAt automatically
-    // Reshape JSON output: expose `id` (string) instead of Mongo's `_id`,
-    // and hide internal fields so responses match our clean API contract.
+    timestamps: true,
     toJSON: {
       virtuals: true,
       versionKey: false,
@@ -56,19 +63,16 @@ const taskSchema = new mongoose.Schema(
   }
 );
 
-const Task = mongoose.model("Task", taskSchema);
+// Reuse the model if it already exists (prevents OverwriteModelError on
+// hot reloads / repeated serverless imports).
+const Task = mongoose.models.Task || mongoose.model("Task", taskSchema);
 
 // ---------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------
-
-// Wrap async handlers so a rejected promise goes to the error middleware
-// instead of crashing the process.
 function wrap(handler) {
   return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 }
-
-// Validate a title value: must be a non-empty (after trim) string.
 function isValidTitle(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -77,7 +81,7 @@ function isValidTitle(value) {
 // Routes
 // ---------------------------------------------------------------------
 
-// GET / — root route. Confirms the server is up and lists the endpoints.
+// GET / — root route, confirms the API is running.
 app.get(
   "/",
   wrap((req, res) => {
@@ -94,7 +98,7 @@ app.get(
   })
 );
 
-// GET /tasks — return every task, newest first (200).
+// GET /tasks — list all tasks, newest first.
 app.get(
   "/tasks",
   wrap(async (req, res) => {
@@ -103,48 +107,39 @@ app.get(
   })
 );
 
-// GET /tasks/:id — return one task by id, or 404 if not found / bad id.
+// GET /tasks/:id — one task, or 404.
 app.get(
   "/tasks/:id",
   wrap(async (req, res) => {
-    // An invalid ObjectId throws a CastError → handled below as 404.
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(404).json({ error: "Task not found" });
     }
     const task = await Task.findById(req.params.id);
-    if (!task) {
-      return res.status(404).json({ error: "Task not found" });
-    }
+    if (!task) return res.status(404).json({ error: "Task not found" });
     res.status(200).json(task);
   })
 );
 
-// POST /tasks — create a task from { title }. id is generated by MongoDB;
-// completed defaults to false. Any client-supplied id/completed is ignored here.
+// POST /tasks — create from { title }.
 app.post(
   "/tasks",
   wrap(async (req, res) => {
     const { title } = req.body || {};
-
     if (!isValidTitle(title)) {
       return res
         .status(400)
         .json({ error: "Title is required and must be a non-empty string" });
     }
-
     const task = await Task.create({ title: title.trim(), completed: false });
-    res.status(201).json(task); // 201 Created
+    res.status(201).json(task);
   })
 );
 
-// PUT /tasks/:id — update title and/or completed. Ignores any client `id`.
-// 404 if the task doesn't exist; 400 if provided fields are invalid.
+// PUT /tasks/:id — update title and/or completed.
 app.put(
   "/tasks/:id",
   wrap(async (req, res) => {
     const { title, completed } = req.body || {};
-
-    // Validate only the fields that were actually provided.
     if (title !== undefined && !isValidTitle(title)) {
       return res
         .status(400)
@@ -155,29 +150,23 @@ app.put(
         .status(400)
         .json({ error: "Completed, if provided, must be a boolean" });
     }
-
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(404).json({ error: "Task not found" });
     }
-
-    // Build an update object from only the allowed, provided fields.
     const updates = {};
     if (title !== undefined) updates.title = title.trim();
     if (completed !== undefined) updates.completed = completed;
 
     const task = await Task.findByIdAndUpdate(req.params.id, updates, {
-      returnDocument: "after", // return the UPDATED document
-      runValidators: true, // enforce schema rules on update
+      returnDocument: "after",
+      runValidators: true,
     });
-
-    if (!task) {
-      return res.status(404).json({ error: "Task not found" });
-    }
+    if (!task) return res.status(404).json({ error: "Task not found" });
     res.status(200).json(task);
   })
 );
 
-// DELETE /tasks/:id — remove a task. 404 if not found, else 200 with confirmation.
+// DELETE /tasks/:id — remove a task.
 app.delete(
   "/tasks/:id",
   wrap(async (req, res) => {
@@ -185,9 +174,7 @@ app.delete(
       return res.status(404).json({ error: "Task not found" });
     }
     const task = await Task.findByIdAndDelete(req.params.id);
-    if (!task) {
-      return res.status(404).json({ error: "Task not found" });
-    }
+    if (!task) return res.status(404).json({ error: "Task not found" });
     res.status(200).json({ message: "Task deleted", task });
   })
 );
@@ -195,14 +182,10 @@ app.delete(
 // ---------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------
-
-// Catch-all 404 for unknown routes → always respond with JSON.
 app.use((req, res) => {
   res.status(404).json({ error: "Route not found" });
 });
 
-// Error-handling middleware MUST be last (4 args). Handles malformed JSON,
-// Mongoose validation/cast errors, and any unexpected errors.
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   if (err.type === "entity.parse.failed" || err instanceof SyntaxError) {
@@ -219,8 +202,15 @@ app.use((err, req, res, next) => {
 });
 
 // ---------------------------------------------------------------------
-// Start the server
+// Start / export
 // ---------------------------------------------------------------------
-app.listen(PORT, () => {
-  console.log(`Task API listening on http://localhost:${PORT}`);
-});
+// Locally: start a normal server. On Vercel: DON'T listen — just export the
+// app so Vercel's serverless runtime can invoke it per request.
+if (!process.env.VERCEL) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () =>
+    console.log(`Task API listening on http://localhost:${PORT}`)
+  );
+}
+
+module.exports = app;
